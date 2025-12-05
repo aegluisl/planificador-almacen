@@ -5,23 +5,41 @@ import time
 import plotly.express as px
 import uuid 
 import json 
+import firebase_admin
 
 # --- FIREBASE & AUTH IMPORTS ---
+# Usamos try/except para manejar el caso donde la librería no esté instalada
 try:
-    # Intenta importar firebase_admin
     from firebase_admin import initialize_app, credentials, firestore, auth
 
-    if not st.session_state.get('firebase_initialized', False):
+    # Decorador que garantiza que esta función solo se ejecute una vez
+    @st.cache_resource
+    def initialize_firebase_app():
+        """
+        Inicializa la aplicación Firebase y el cliente Firestore.
+        Usa st.cache_resource para evitar el error de re-inicialización ("The default Firebase app already exists").
+        """
+        
+        # Clase MockDB para simular la base de datos si Firebase no está disponible (Almacenamiento Local)
+        class MockDB:
+            def collection(self, path): return self
+            def document(self, doc_id): return self
+            # Simular que no existe el documento para forzar el array vacío en la carga
+            def get(self): return type('', (object,), {'exists': False, 'to_dict': lambda: {}})() 
+            def set(self, data): pass
+            def on_snapshot(self, callback): pass
+            def client(self): return self # Retorna una instancia de sí mismo para el cliente
+        
         try:
             # 1. Intentar cargar las credenciales de Firebase desde los secretos de Streamlit
             if "FIREBASE_KEY" in st.secrets:
                 
-                # --- Lógica CRUCIAL para leer el secreto en formato TOML de campo por campo ---
+                # --- Lógica para leer el secreto en formato TOML de campo por campo ---
                 creds_dict = {
                     "type": st.secrets.FIREBASE_KEY.type,
                     "project_id": st.secrets.FIREBASE_KEY.project_id,
                     "private_key_id": st.secrets.FIREBASE_KEY.private_key_id,
-                    "private_key": st.secrets.FIREBASE_KEY.private_key, # El TOML maneja bien los saltos de línea aquí
+                    "private_key": st.secrets.FIREBASE_KEY.private_key, 
                     "client_email": st.secrets.FIREBASE_KEY.client_email,
                     "client_id": st.secrets.FIREBASE_KEY.client_id,
                     "auth_uri": st.secrets.FIREBASE_KEY.auth_uri,
@@ -31,42 +49,48 @@ try:
                     "universe_domain": st.secrets.FIREBASE_KEY.universe_domain
                 }
                 
-                # Crear las credenciales de Firebase a partir del diccionario
-                cred = credentials.Certificate(creds_dict)
-                initialize_app(cred)
+                # 2. Inicializar la aplicación si no existe
+                if not firebase_admin._apps:
+                    cred = credentials.Certificate(creds_dict)
+                    initialize_app(cred)
+                
+                # 3. Obtener el cliente de Firestore
                 db = firestore.client()
                 st.session_state.db_online = True
                 st.session_state.firebase_initialized = True
+                return db
             
             else:
-                 # Si los secretos no están configurados (Entorno de Canvas o local sin secretos)
-                try:
-                    # Intentar usar la inicialización global de Canvas
-                    db = firestore.client()
-                    st.session_state.db_online = True
-                except:
-                    # Fallback si Firebase no está disponible.
-                    st.warning("Firebase no detectado. La aplicación funcionará, pero los datos NO serán persistentes ni compartidos.")
-                    class MockDB:
-                        def collection(self, path): return self
-                        def document(self, doc_id): return self
-                        def get(self): return type('', (object,), {'exists': False})() 
-                        def set(self, data): pass
-                        def on_snapshot(self, callback): pass
-                    db = MockDB()
-                    st.session_state.db_online = False
+                # Fallback para entornos sin secretos o sin Firebase
+                st.warning("Firebase no detectado en secretos. Usando MockDB (Datos NO persistentes ni compartidos).")
+                st.session_state.db_online = False
+                st.session_state.firebase_initialized = True
+                return MockDB().client() # Devolver el cliente simulado
 
         except Exception as e:
-            st.error(f"Error al inicializar Firebase con Secretos: {e}. ¿El formato TOML es correcto?")
+            # Manejar errores de inicialización (como clave incorrecta)
+            st.error(f"Error al inicializar Firebase con Secretos: {e}.")
             st.session_state.db_online = False
+            st.session_state.firebase_initialized = True
+            return MockDB().client() # Devolver el cliente simulado en caso de error
 
-    else:
-        # Ya inicializado, obtener la referencia
-        db = firestore.client() if st.session_state.get('db_online', False) else None
-        
+    # Llamar a la función cacheada para obtener el objeto db
+    db = initialize_firebase_app()
+    
 except ImportError:
     st.warning("La librería `firebase_admin` no está instalada o disponible. La aplicación funcionará, pero los datos NO serán persistentes ni compartidos.")
     st.session_state.db_online = False
+    
+    # Definir db como None o una MockDB para que el resto del código no falle
+    class MockDB:
+        def collection(self, path): return self
+        def document(self, doc_id): return self
+        def get(self): return type('', (object,), {'exists': False, 'to_dict': lambda: {}})()
+        def set(self, data): pass
+        def on_snapshot(self, callback): pass
+        def client(self): return self
+    db = MockDB().client()
+
 
 # --- Configuración de la Página ---
 st.set_page_config(page_title="Planificador de Almacén", layout="wide", page_icon="📦")
@@ -128,10 +152,12 @@ def get_doc_id(target_date):
 @st.cache_data(show_spinner="Cargando plan desde la nube...")
 def load_plan_from_firestore(target_date):
     """Carga las asignaciones para la fecha dada desde Firestore."""
+    # Usar el objeto 'db' que fue devuelto por la función initialize_firebase_app()
     if not st.session_state.get('db_online', False) or db is None:
         return []
 
     doc_id = get_doc_id(target_date)
+    # db puede ser MockDB si no se pudo inicializar, por lo que llamamos a collection
     doc_ref = db.collection(COLLECTION_PATH).document(doc_id)
     doc = doc_ref.get()
 
@@ -207,7 +233,9 @@ def agregar_tarea(tecnico, tarea, hora_inicio, hora_fin, notas):
     save_plan_to_firestore(st.session_state.asignaciones, st.session_state.fecha_plan)
 
     st.success(f"Asignado: {tarea} a {tecnico}")
-    st.cache_data.clear() # Limpia el caché para la próxima carga
+    # Nota: No necesitamos clear() aquí si load_plan_from_firestore usa st.cache_data, 
+    # pero lo mantenemos por seguridad si la lógica de cacheo se complica.
+    st.cache_data.clear() 
     st.rerun()
 
 def limpiar_dia():
@@ -232,6 +260,7 @@ def handle_date_change(new_date):
     st.rerun()
 
 # --- Inicialización/Recarga del Estado ---
+# La inicialización de Firebase ya está cacheada. Esto solo carga los datos de la fecha actual
 if 'data_loaded_for_date' not in st.session_state or st.session_state.data_loaded_for_date != st.session_state.fecha_plan:
     st.session_state.asignaciones = load_plan_from_firestore(st.session_state.fecha_plan)
     st.session_state.data_loaded_for_date = st.session_state.fecha_plan
@@ -323,7 +352,7 @@ with col2:
     fig.update_layout(
         xaxis_range=[inicio_dia, fin_dia],
         xaxis=dict(
-            title="Horario (07:45 AM - 08:30 PM)",
+            title="Horario (07:00 AM - 09:00 PM)",
             tickformat="%H:%M",
             dtick=3600000.0,
             side="top"
